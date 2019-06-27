@@ -104,6 +104,9 @@ static void curses_segv_handler(int sig)
 #ifdef HAVE_LIBUNWIND
   show_backtrace();
 #endif
+#ifdef USE_DEVEL_GRAPHVIZ
+  dump_graphviz("segfault");
+#endif
 
   struct sigaction act;
   sigemptyset(&act.sa_mask);
