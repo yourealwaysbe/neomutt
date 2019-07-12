@@ -60,6 +60,7 @@
 #include "options.h"
 #include "protos.h"
 #include "sidebar.h"
+#include "tracker.h"
 #include "version.h"
 #ifdef USE_HCACHE
 #include "hcache/hcache.h"
@@ -778,6 +779,8 @@ static void remove_from_stailq(struct ListHead *head, const char *str)
  */
 static int source_rc(const char *rcfile_path, struct Buffer *err)
 {
+  // printf("PUSH: %s\n", rcfile_path);
+  // ct_dump();
   int line = 0, rc = 0, warnings = 0;
   enum CommandResult line_rc;
   struct Buffer token;
@@ -829,6 +832,8 @@ static int source_rc(const char *rcfile_path, struct Buffer *err)
     mutt_buffer_printf(err, "%s: %s", rcfile, strerror(errno));
     return -1;
   }
+
+  ct_push_top(); // Inherit the 'account' of the parent config file
 
   mutt_buffer_init(&token);
   while ((linebuf = mutt_file_read_line(linebuf, &buflen, fp, &line, MUTT_CONT)))
@@ -905,6 +910,9 @@ static int source_rc(const char *rcfile_path, struct Buffer *err)
     FREE(&np);
   }
 
+  // printf("POP\n");
+  ct_pop(); // The 'account' command stops at the end of the file
+  // ct_dump();
   return rc;
 }
 
@@ -1343,7 +1351,9 @@ static enum CommandResult parse_mailboxes(struct Buffer *buf, struct Buffer *s,
 {
   while (MoreArgs(s))
   {
-    struct Mailbox *m = mailbox_new();
+    // printf("PM: %s\n", s->data);
+    // ct_dump();
+    struct Mailbox *m = mailbox_new(NULL);
 
     if (data & MUTT_NAMED)
     {
@@ -1368,7 +1378,17 @@ static enum CommandResult parse_mailboxes(struct Buffer *buf, struct Buffer *s,
     }
 
     mutt_buffer_strcpy(&m->pathbuf, buf->data);
-    /* int rc = */ mx_path_canon2(m, C_Folder);
+
+    // Lookup $folder for the current Account
+    struct Account *a = ct_get_account();
+    struct ConfigSubset *sub = a ? a->sub : NeoMutt->sub;
+    struct Buffer *folder = mutt_buffer_pool_get();
+    struct HashElem *he = cs_subset_lookup(sub, "folder");
+    cs_subset_string_get(sub, he, folder);
+    // mutt_message("%s", m->pathbuf->data);
+    mx_path_canon2(m, folder->data);
+    // mutt_message("%s", m->pathbuf->data);
+    mutt_buffer_pool_release(&folder);
 
     if (m->magic <= MUTT_UNKNOWN)
     {
@@ -1378,7 +1398,8 @@ static enum CommandResult parse_mailboxes(struct Buffer *buf, struct Buffer *s,
     }
 
     bool new_account = false;
-    struct Account *a = mx_ac_find(m);
+    if (!a)
+      a = mx_ac_find(m);
     if (!a)
     {
       a = account_new(NULL, NeoMutt->sub);
@@ -1417,7 +1438,9 @@ static enum CommandResult parse_mailboxes(struct Buffer *buf, struct Buffer *s,
     if (new_account)
     {
       neomutt_account_add(NeoMutt, a);
+      m->sub->cs = a->sub->cs; // Work around our lazy-allocation order
     }
+    ct_set_mailbox(m);
 
 #ifdef USE_SIDEBAR
     mutt_sb_notify_mailbox(m, true);
@@ -1426,6 +1449,7 @@ static enum CommandResult parse_mailboxes(struct Buffer *buf, struct Buffer *s,
     mutt_monitor_add(m);
 #endif
   }
+  // ct_dump();
   return MUTT_CMD_SUCCESS;
 }
 
@@ -1533,6 +1557,7 @@ static enum CommandResult parse_set(struct Buffer *buf, struct Buffer *s,
   static const char *set_commands[] = { "set", "toggle", "unset", "reset" };
 
   int rc = 0;
+  struct ConfigSubset *sub = NeoMutt->sub;
 
   while (MoreArgs(s))
   {
@@ -1584,7 +1609,11 @@ static enum CommandResult parse_set(struct Buffer *buf, struct Buffer *s,
     bool my = mutt_str_startswith(buf->data, "my_", CASE_MATCH);
     if (!my)
     {
-      he = cs_get_elem(Config, buf->data);
+      sub = ct_get_sub();
+      he = cs_subset_lookup(sub, buf->data);
+      if (!he)
+        he = cs_subset_create_var(sub, buf->data, err);
+
       if (!he)
       {
         if (reset && (mutt_str_strcmp(buf->data, "all") == 0))
@@ -1769,7 +1798,7 @@ static enum CommandResult parse_set(struct Buffer *buf, struct Buffer *s,
             mutt_buffer_dealloc(&scratch);
           }
 
-          rc = cs_he_string_set(Config, he, buf->data, err);
+          rc = cs_subset_string_set(sub, he, buf->data, err);
           if (CSR_RESULT(rc) != CSR_SUCCESS)
             return MUTT_CMD_ERROR;
         }
@@ -1780,7 +1809,7 @@ static enum CommandResult parse_set(struct Buffer *buf, struct Buffer *s,
         if (bq)
         {
           // mutt_buffer_printf(err, "ACT23 set variable %s to 'yes'", buf->data);
-          rc = cs_he_native_set(Config, he, true, err);
+          rc = cs_subset_native_set(sub, he, true, err);
           if (CSR_RESULT(rc) != CSR_SUCCESS)
             return MUTT_CMD_ERROR;
           continue;
@@ -1838,7 +1867,7 @@ static enum CommandResult parse_set(struct Buffer *buf, struct Buffer *s,
       else
       {
         // mutt_buffer_printf(err, "ACT26 UNSET bool/quad variable %s", buf->data);
-        rc = cs_he_native_set(Config, he, false, err);
+        rc = cs_subset_native_set(sub, he, false, err);
         if (CSR_RESULT(rc) != CSR_SUCCESS)
           return MUTT_CMD_ERROR;
       }
@@ -1846,7 +1875,7 @@ static enum CommandResult parse_set(struct Buffer *buf, struct Buffer *s,
     }
     else
     {
-      rc = cs_he_string_set(Config, he, NULL, err);
+      rc = cs_subset_string_set(sub, he, NULL, err);
       if (CSR_RESULT(rc) != CSR_SUCCESS)
         return MUTT_CMD_ERROR;
     }
